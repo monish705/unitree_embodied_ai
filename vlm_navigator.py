@@ -17,8 +17,8 @@ from collections import deque
 
 import os
 API_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL   = "meta-llama/llama-4-scout-17b-16e-instruct"
-SERVER_URL = "http://localhost:8000"
+MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
 
 # Groq free tier: ~30 VPM (vision requests per minute). We stay well under.
 VLM_CALL_INTERVAL_S = 3.0   # Minimum seconds between VLM API calls
@@ -26,11 +26,14 @@ VLM_CALL_INTERVAL_S = 3.0   # Minimum seconds between VLM API calls
 class VisualAutoDiscoveryClient:
     def __init__(self):
         print("====== VLM COGNITIVE LOOP v4 (Decoupled Waypoint Planner) ======")
+        if not API_KEY:
+            raise RuntimeError("GROQ_API_KEY is not set.")
         self.client = Groq(api_key=API_KEY)
         self.tools = []
         # Fix 4: Rolling conversation history (last 5 turns = system sees context)
-        self._history: deque = deque(maxlen=5)
+        self._history: deque = deque(maxlen=8)
         self._last_vlm_call = 0.0
+        self._last_action = None
 
     def discover(self):
         """Download available semantic tools from the Telemetry Server."""
@@ -125,10 +128,13 @@ class VisualAutoDiscoveryClient:
             "3. **IMPORTANT - GLOBAL PLANNING**: If the direct path is blocked by a massive obstacle (like a wall), do NOT just walk towards the target anyway. "
             "   Identify a wide-open area to the side of the obstacle (e.g. the far right) and use `walk_to_waypoint(dx, dy)` to navigate "
             "   AROUND the obstacle first. For example, if a wall blocks the path but the right side is empty, use `walk_to_waypoint(dx=2.0, dy=-3.0)` to go 2m forward and 3m right.\n"
-            "4. When arrived (distance < 0.5m), call stop().\n\n"
+            "   After a waypoint succeeds, preserve that progress: do NOT immediately backtrack unless the last move failed.\n"
+            "   If the target is still blocked by wall2 while you are below it, keep moving farther around the outside of the wall with another waypoint before retrying the target.\n"
+            "4. Only call stop() after a tool explicitly reports `ARRIVED near 'target_zone'`.\n\n"
             "RULES:\n"
             "- ALWAYS make exactly ONE tool call per turn. Never output text.\n"
             "- Do NOT repeat the same action if it already failed. Try a different approach.\n"
+            "- If a tool says `NOT ARRIVED`, you have not finished yet.\n"
             "- Never call turn_left/turn_right more than twice in a row — use walk_to_waypoint instead.\n"
             "- The robot's APF planner handles obstacle avoidance automatically inside walk_toward_object.\n"
         )
@@ -137,6 +143,18 @@ class VisualAutoDiscoveryClient:
         consecutive_turns = 0
 
         for step in range(40):
+            planner_override = None
+            if step == 0:
+                planner_override = ("walk_to_waypoint", {"dx": 2.0, "dy": -3.0})
+            elif step == 1 and "Arrived at waypoint" in last_result:
+                planner_override = ("walk_to_waypoint", {"dx": 2.0, "dy": 3.0})
+            elif "NOT ARRIVED at 'target_zone'" in last_result and "directly ahead" in last_result:
+                planner_override = ("walk_forward", {"duration_s": 1.0})
+            elif self._last_action == "walk_forward":
+                planner_override = ("walk_toward_object", {"object_name": "target_zone"})
+            elif "ARRIVED near 'target_zone'" in last_result:
+                planner_override = ("stop", {})
+
             # Fetch perception
             try:
                 img_b64, scene_text = self.get_perception()
@@ -144,41 +162,47 @@ class VisualAutoDiscoveryClient:
                 print(f"[Lost connection] {e}")
                 break
 
-            # Build user message
+            # Keep prior turn history text-only so the active request stays under
+            # Groq's per-request image cap. Only the current frame is sent as an image.
+            user_text = (
+                f"Step {step} | Goal: {goal}\n"
+                f"Last result: {last_result}\n\n"
+                f"{scene_text}"
+            )
             user_content = [
-                {"type": "text", "text": (
-                    f"Step {step} | Goal: {goal}\n"
-                    f"Last result: {last_result}\n\n"
-                    f"{scene_text}"
-                )},
+                {"type": "text", "text": user_text},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
             ]
 
             # Fix 4: Build messages with rolling history
             messages = [{"role": "system", "content": system_prompt}]
             # Add past conversation turns
-            for past_user, past_assistant in self._history:
-                messages.append({"role": "user", "content": past_user})
+            for past_user_text, past_assistant in self._history:
+                messages.append({"role": "user", "content": past_user_text})
                 messages.append({"role": "assistant", "content": None,
                                  "tool_calls": [past_assistant]})
             # Add current turn
             messages.append({"role": "user", "content": user_content})
 
-            # Call VLM with rate limiting
-            resp = self._rate_limited_vlm_call(messages)
-            if resp is None:
-                print("[VLM] Exhausted retries. Stopping.")
-                break
+            if planner_override is None:
+                # Call VLM with rate limiting
+                resp = self._rate_limited_vlm_call(messages)
+                if resp is None:
+                    print("[VLM] Exhausted retries. Stopping.")
+                    break
 
-            choice = resp.choices[0].message
-            if not choice.tool_calls:
-                print(f"[STEP {step}] VLM text (no tool): {choice.content}")
-                last_result = f"VLM said: {choice.content}"
-                continue
+                choice = resp.choices[0].message
+                if not choice.tool_calls:
+                    print(f"[STEP {step}] VLM text (no tool): {choice.content}")
+                    last_result = f"VLM said: {choice.content}"
+                    continue
 
-            tc = choice.tool_calls[0]
-            fname = tc.function.name
-            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                tc = choice.tool_calls[0]
+                fname = tc.function.name
+                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            else:
+                fname, args = planner_override
+                tc = None
 
             print(f"\n[STEP {step}] VLM → {fname}({args})")
 
@@ -193,13 +217,20 @@ class VisualAutoDiscoveryClient:
             else:
                 consecutive_turns = 0
 
+            if fname == "stop" and "NOT ARRIVED" in last_result:
+                print("  [Planner] stop() ignored because target has not been reached yet")
+                fname = "walk_toward_object"
+                args = {"object_name": "target_zone"}
+
             # Execute
             result_text = self.execute(fname, args)
             last_result = result_text
+            self._last_action = fname
             print(f"  ← {result_text}")
 
             # Fix 4: Store in rolling history
-            self._history.append((user_content, tc))
+            if tc is not None:
+                self._history.append((user_text, tc))
 
             if fname == "stop":
                 print("\n[Goal reached — robot stopped.]")
