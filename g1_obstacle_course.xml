@@ -1,0 +1,54 @@
+<mujoco model="g1_obstacle_course">
+  <include file="g1.xml"/>
+
+  <!-- Override G1's implicitfast integrator — it breaks contact for non-robot geoms -->
+  <option integrator="Euler" timestep="0.002"/>
+
+  <statistic center="2.0 0 0.8" extent="6.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.15 0.15 0.15" specular="0.5 0.5 0.5"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8"
+             width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="obstacle_mat" rgba="0.6 0.2 0.2 1"/>
+    <material name="target_mat" rgba="0.2 0.8 0.2 1"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ground -->
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <light pos="0.6 0 2.5" dir="0 0 -1" diffuse="0.5 0.5 0.5" specular="0.2 0.2 0.2" directional="true"/>
+    <light pos="1 -1 2" dir="-0.5 0.5 -1" diffuse="0.3 0.3 0.3"/>
+
+    <!-- OBSTACLE COURSE -->
+    <!-- Obstacle 1: Wall on the left -->
+    <geom name="wall1" type="box" pos="1.2 1.2 0.4" size="0.2 1.2 0.4" material="obstacle_mat" friction="0.8 0.005 0.0001"/>
+    
+    <!-- Obstacle 3: Low block pushed further down the track to create a gap -->
+    <geom name="block1" type="box" pos="2.4 0.2 0.2" size="0.4 0.4 0.2" material="obstacle_mat" friction="0.8 0.005 0.0001"/>
+
+    <!-- Obstacle 2: Wall on the right pushed even further down -->
+    <geom name="wall2" type="box" pos="3.8 -1.2 0.4" size="0.2 1.2 0.4" material="obstacle_mat" friction="0.8 0.005 0.0001"/>
+
+    <!-- TARGET AREA -->
+    <!-- Visual marker for the destination point A to B -->
+    <!-- Replaced small cylinder with a massive glowing green pillar for VLM visibility -->
+    <geom name="target_zone" type="box" pos="4.5 0.0 0.5" size="0.5 1.0 0.5" rgba="0.1 0.9 0.1 1" condim="3"/>
+
+    <!-- CAMERAS -->
+    <!-- Static overhead view for human monitoring -->
+    <camera name="god_cam" pos="2.0 0.0 7.0" xyaxes="1 0 0 0 -1 0" fovy="70"/>
+    <camera name="overview_cam" pos="1.8 -3.0 3.0" xyaxes="1 0 0 0 0.7 0.7" fovy="60"/>
+    <!-- head_cam is defined in g1.xml inside torso_link body -->
+  </worldbody>
+
+</mujoco>
